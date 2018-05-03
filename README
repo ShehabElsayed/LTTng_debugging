@@ -1,0 +1,9 @@
+lttng_source:
+	Contains the modified LTTng source, mainly the ust folder
+
+benchmark:
+	Contains one of the problematic benchmarks (fluianimate)
+	1- Go to src/
+	2- make
+	3- ./fluidanimate 2 1 ../inputs/in_5k.fluid out.fluid  --> succeeds
+	4- Same command fails (gets) stuck when LTTng pthread wrappers are preloaded

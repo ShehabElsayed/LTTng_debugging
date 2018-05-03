@@ -1,0 +1,177 @@
+From 8671c6ae839615c0779041abada4703680fbc003 Mon Sep 17 00:00:00 2001
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Date: Tue, 20 Mar 2018 17:32:36 -0400
+Subject: [RFC PATCH v2] Fix: perf event mutex with pthread wrapper
+
+We do not want to recurse in the pthread mutex instrumentation when
+setting up the perf counters for a given thread.
+
+Introduce a "notrace" per-thread counter to inhibit tracing for the
+current thread.
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+---
+ include/lttng/ust-events.h                 |  6 ++++++
+ include/lttng/ust-tracepoint-event.h       |  7 ++-----
+ liblttng-ust/lttng-context-perf-counters.c |  2 ++
+ liblttng-ust/lttng-events.c                | 14 ++++++++++++++
+ liblttng-ust/lttng-tracer-core.h           |  3 +++
+ liblttng-ust/lttng-ust-comm.c              | 23 +++++++++++++++++++++++
+ 6 files changed, 50 insertions(+), 5 deletions(-)
+
+diff --git a/include/lttng/ust-events.h b/include/lttng/ust-events.h
+index 86733503..f8c130f9 100644
+--- a/include/lttng/ust-events.h
++++ b/include/lttng/ust-events.h
+@@ -738,6 +738,12 @@ struct lttng_enum *lttng_ust_enum_get_from_desc(struct lttng_session *session,
+ void lttng_ust_dl_update(void *ip);
+ void lttng_ust_fixup_fd_tracker_tls(void);
+ 
++void lttng_ust_begin_notrace(void);
++void lttng_ust_end_notrace(void);
++
++int lttng_ust_do_trace(struct lttng_session *session,
++		struct lttng_channel *chan, struct lttng_event *event);
++
+ /* For backward compatibility. Leave those exported symbols in place. */
+ extern struct lttng_ctx *lttng_static_ctx;
+ void lttng_context_init(void);
+diff --git a/include/lttng/ust-tracepoint-event.h b/include/lttng/ust-tracepoint-event.h
+index ec292d24..0bc002f7 100644
+--- a/include/lttng/ust-tracepoint-event.h
++++ b/include/lttng/ust-tracepoint-event.h
+@@ -766,11 +766,8 @@ void __event_probe__##_provider##___##_name(_TP_ARGS_DATA_PROTO(_args))	      \
+ 		(void) __dynamic_len_idx;	/* don't warn if unused */    \
+ 	if (!_TP_SESSION_CHECK(session, __chan->session))		      \
+ 		return;							      \
+-	if (caa_unlikely(!CMM_ACCESS_ONCE(__chan->session->active)))	      \
+-		return;							      \
+-	if (caa_unlikely(!CMM_ACCESS_ONCE(__chan->enabled)))		      \
+-		return;							      \
+-	if (caa_unlikely(!CMM_ACCESS_ONCE(__event->enabled)))		      \
++	if (caa_unlikely(!lttng_ust_do_trace(__chan->session, __chan,	      \
++					     __event)))			      \
+ 		return;							      \
+ 	if (caa_unlikely(!TP_RCU_LINK_TEST()))				      \
+ 		return;							      \
+diff --git a/liblttng-ust/lttng-context-perf-counters.c b/liblttng-ust/lttng-context-perf-counters.c
+index a15417cc..131aaa54 100644
+--- a/liblttng-ust/lttng-context-perf-counters.c
++++ b/liblttng-ust/lttng-context-perf-counters.c
+@@ -291,6 +291,7 @@ struct lttng_perf_counter_thread_field *
+ 	ret = pthread_sigmask(SIG_BLOCK, &newmask, &oldmask);
+ 	if (ret)
+ 		abort();
++	lttng_ust_begin_notrace();
+ 	/* Check again with signals disabled */
+ 	cds_list_for_each_entry_rcu(thread_field, &perf_thread->rcu_field_list,
+ 			rcu_field_node) {
+@@ -315,6 +316,7 @@ struct lttng_perf_counter_thread_field *
+ 			&perf_field->thread_field_list);
+ 	ust_unlock();
+ skip:
++	lttng_ust_end_notrace();
+ 	ret = pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
+ 	if (ret)
+ 		abort();
+diff --git a/liblttng-ust/lttng-events.c b/liblttng-ust/lttng-events.c
+index 255c4b95..d8e4fd79 100644
+--- a/liblttng-ust/lttng-events.c
++++ b/liblttng-ust/lttng-events.c
+@@ -1284,3 +1284,17 @@ void lttng_ust_context_set_session_provider(const char *name,
+ 		}
+ 	}
+ }
++
++int lttng_ust_do_trace(struct lttng_session *session,
++		struct lttng_channel *chan, struct lttng_event *event)
++{
++	if (caa_unlikely(!CMM_ACCESS_ONCE(session->active)))
++		return 0;
++	if (caa_unlikely(!CMM_ACCESS_ONCE(chan->enabled)))
++		return 0;
++	if (caa_unlikely(!CMM_ACCESS_ONCE(event->enabled)))
++		return 0;
++	if (caa_unlikely(URCU_TLS(lttng_ust_notrace_thread)) > 0)
++		return 0;
++	return 1;
++}
+diff --git a/liblttng-ust/lttng-tracer-core.h b/liblttng-ust/lttng-tracer-core.h
+index ba232f32..98d79be8 100644
+--- a/liblttng-ust/lttng-tracer-core.h
++++ b/liblttng-ust/lttng-tracer-core.h
+@@ -25,6 +25,7 @@
+ #include <stddef.h>
+ #include <urcu/arch.h>
+ #include <urcu/list.h>
++#include <urcu/tls-compat.h>
+ #include <lttng/ust-tracer.h>
+ #include <lttng/bug.h>
+ #include <lttng/ringbuffer-config.h>
+@@ -37,6 +38,8 @@ struct lttng_ctx_field;
+ struct lttng_ust_lib_ring_buffer_ctx;
+ struct lttng_ctx_value;
+ 
++extern DECLARE_URCU_TLS(int, lttng_ust_notrace_thread);
++
+ int ust_lock(void) __attribute__ ((warn_unused_result));
+ void ust_lock_nocheck(void);
+ void ust_unlock(void);
+diff --git a/liblttng-ust/lttng-ust-comm.c b/liblttng-ust/lttng-ust-comm.c
+index d4add1c0..9520f246 100644
+--- a/liblttng-ust/lttng-ust-comm.c
++++ b/liblttng-ust/lttng-ust-comm.c
+@@ -92,6 +92,9 @@ static pthread_mutex_t ust_mutex = PTHREAD_MUTEX_INITIALIZER;
+ /* Allow nesting the ust_mutex within the same thread. */
+ static DEFINE_URCU_TLS(int, ust_mutex_nest);
+ 
++/* Do not trace events for the current thread. */
++DEFINE_URCU_TLS(int, lttng_ust_notrace_thread) __attribute__((visibility("hidden")));
++
+ /*
+  * ust_exit_mutex protects thread_active variable wrt thread exit. It
+  * cannot be done by ust_mutex because pthread_cancel(), which takes an
+@@ -121,6 +124,19 @@ static int lttng_ust_comm_should_quit;
+ int lttng_ust_loaded __attribute__((weak));
+ 
+ /*
++ * Inhibit lttng-ust tracing for this thread.
++ */
++void lttng_ust_begin_notrace(void)
++{
++	URCU_TLS(lttng_ust_notrace_thread)++;
++}
++
++void lttng_ust_end_notrace(void)
++{
++	--URCU_TLS(lttng_ust_notrace_thread);
++}
++
++/*
+  * Return 0 on success, -1 if should quit.
+  * The lock is taken in both cases.
+  * Signal-safe.
+@@ -392,6 +408,12 @@ void lttng_fixup_ust_mutex_nest_tls(void)
+ 	asm volatile ("" : : "m" (URCU_TLS(ust_mutex_nest)));
+ }
+ 
++static
++void lttng_fixup_lttng_ust_notrace_tls(void)
++{
++	asm volatile ("" : : "m" (URCU_TLS(lttng_ust_notrace_thread)));
++}
++
+ /*
+  * Fixup urcu bp TLS.
+  */
+@@ -410,6 +432,7 @@ void lttng_ust_fixup_tls(void)
+ 	lttng_fixup_nest_count_tls();
+ 	lttng_fixup_procname_tls();
+ 	lttng_fixup_ust_mutex_nest_tls();
++	lttng_fixup_lttng_ust_notrace_tls();
+ 	lttng_ust_fixup_fd_tracker_tls();
+ }
+ 
+-- 
+2.11.0
+
